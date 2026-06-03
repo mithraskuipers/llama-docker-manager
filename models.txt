@@ -1,0 +1,5 @@
+# llama-manager model list
+# One HuggingFace repo ID per line
+# Lines starting with # are ignored
+
+HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive:Q4_K_M

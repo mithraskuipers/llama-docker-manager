@@ -1,0 +1,8 @@
+# Local secrets
+.env
+
+# Downloaded models (large binary files)
+models/
+
+# macOS
+.DS_Store
