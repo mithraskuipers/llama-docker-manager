@@ -45,6 +45,50 @@ require_cmd() {
   command -v "$1" &>/dev/null || die "'$1' is required but not installed."
 }
 
+# ── Docker health check ───────────────────────────────────────────────────────
+#
+#  Verifies not just that the `docker` CLI exists, but that it can actually
+#  talk to a running daemon. This covers two setups:
+#    - WSL, where the daemon lives in Docker Desktop on Windows and is
+#      reached through the WSL integration
+#    - bare-metal / native Linux, where dockerd runs locally as a service
+#
+is_wsl() {
+  # /proc/version on WSL mentions "microsoft" (WSL2) or "Microsoft" (WSL1)
+  grep -qi "microsoft" /proc/version 2>/dev/null
+}
+
+check_docker() {
+  log_debug "Checking docker connectivity..."
+
+  if docker info &>/dev/null; then
+    log_debug "Docker daemon is reachable."
+    return 0
+  fi
+
+  log_error "Docker command found, but the Docker daemon is not reachable."
+  echo ""
+
+  if is_wsl; then
+    log_warn "Detected WSL."
+    log_warn "  This script expects Docker Desktop running on Windows with WSL integration enabled."
+    log_warn "  → Start Docker Desktop on Windows"
+    log_warn "  → Docker Desktop → Settings → Resources → WSL Integration"
+    log_warn "     enable it for this distro, then click 'Apply & Restart'"
+    log_warn "  → Re-run this script once the whale icon in the tray shows 'running'"
+  else
+    log_warn "Detected a native Linux environment."
+    log_warn "  → Check the service status: sudo systemctl status docker"
+    log_warn "  → Start it:                 sudo systemctl start docker"
+    log_warn "  → Start on boot:            sudo systemctl enable docker"
+    log_warn "  → If you're not in the docker group, you may need: sudo docker ..."
+    log_warn "     or add yourself: sudo usermod -aG docker \$USER  (then log out/in)"
+  fi
+
+  echo ""
+  die "Cannot continue without a working Docker connection."
+}
+
 # ── HF Token loading ────────────────────────────────────────────────────────
 #
 #  Priority order:
@@ -481,6 +525,45 @@ cmd_delete() {
   fi
 }
 
+# ── API usage banner ──────────────────────────────────────────────────────────
+#
+#  Printed right before the container starts (docker run -it blocks in the
+#  foreground and floods the terminal with model logs), so this is the last
+#  clean thing the user sees and it stays in their scrollback.
+#
+print_api_usage_banner() {
+  local port="$1"
+  local rule
+  rule=$(printf '─%.0s' {1..64})
+
+  echo -e "${BOLD}${GREEN}${rule}${NC}"
+  echo -e "${BOLD}${GREEN}  ✔ Server starting — here's how to use it${NC}"
+  echo -e "${BOLD}${GREEN}${rule}${NC}"
+  echo ""
+  echo -e "  ${BOLD}Chat in your browser${NC}"
+  echo -e "    ${CYAN}http://localhost:${port}${NC}"
+  echo ""
+  echo -e "  ${BOLD}Use it as an API${NC}  ${DIM}(OpenAI-compatible, no key needed)${NC}"
+  echo -e "    Base URL:  ${CYAN}http://localhost:${port}/v1${NC}"
+  echo ""
+  echo -e "  ${BOLD}Quick test${NC}"
+  echo -e "    ${DIM}curl http://localhost:${port}/v1/chat/completions \\\\${NC}"
+  echo -e "    ${DIM}  -H \"Content-Type: application/json\" \\\\${NC}"
+  echo -e "    ${DIM}  -d '{\"model\":\"local\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello!\"}]}'${NC}"
+  echo ""
+  echo -e "  ${BOLD}Plug into other tools${NC} ${DIM}(VS Code extensions, LangChain, scripts, etc.)${NC}"
+  echo -e "    Base URL : ${CYAN}http://localhost:${port}/v1${NC}   ${DIM}(if calling from this machine)${NC}"
+  echo -e "    API key  : ${DIM}anything, e.g. \"none\" — it isn't checked${NC}"
+  echo -e "    ${DIM}Only use http://host.docker.internal:${port}/v1 if the caller is itself${NC}"
+  echo -e "    ${DIM}running inside another Docker container.${NC}"
+  echo ""
+  echo -e "  ${BOLD}Manage it${NC}"
+  echo -e "    Check status : ${DIM}bash $(basename "$0") status${NC}  ${DIM}(or menu option)${NC}"
+  echo -e "    Stop server  : ${DIM}bash $(basename "$0") stop${NC}    ${DIM}(or menu option)${NC}"
+  echo -e "${BOLD}${GREEN}${rule}${NC}"
+  echo ""
+}
+
 # ── cmd: run ──────────────────────────────────────────────────────────────────
 cmd_run() {
   header "🚀 Run Model Server"
@@ -567,8 +650,14 @@ cmd_run() {
   log_info "  Container : ${CONTAINER_NAME}"
   echo ""
 
+  # Clean up any stale/stuck container left behind by a previous forced kill
+  if docker inspect "$CONTAINER_NAME" &>/dev/null 2>&1; then
+    log_warn "Found a leftover container named '${CONTAINER_NAME}' — removing it first."
+    docker rm -f "$CONTAINER_NAME" &>/dev/null || true
+  fi
+
   local docker_cmd=(
-    docker run -it --rm
+    docker run -d --rm
     --name "$CONTAINER_NAME"
     -p "${port}:8080"
     -v "${dir_path}:/models:ro"
@@ -581,7 +670,6 @@ cmd_run() {
   if [[ -n "$hf_token" ]]; then
     envfile=$(make_token_envfile "$hf_token")
     docker_cmd+=(--env-file "$envfile")
-    trap '[[ -n "$envfile" ]] && rm -f "$envfile"' EXIT
   fi
 
   docker_cmd+=(
@@ -595,17 +683,36 @@ cmd_run() {
 
   echo -e "${DIM}$ ${docker_cmd[*]}${NC}\n"
 
-  # Clean up env-file after container exits
-  "${docker_cmd[@]}" || true
+  # ── Run detached and return control immediately ─────────────────────────────
+  #
+  #  llama.cpp's own SIGINT handler can hang mid-cleanup (seen in practice with
+  #  CUDA teardown), which used to make a foreground `docker run -it` totally
+  #  unkillable from the same terminal. Running detached avoids that problem
+  #  entirely: this command starts the server and hands control straight back
+  #  to the menu. Use "Stop" to shut it down (always force-kills reliably).
+  #
+  if ! "${docker_cmd[@]}" &>/dev/null; then
+    log_error "Failed to start the container."
+    [[ -n "$envfile" ]] && rm -f "$envfile"
+    return 1
+  fi
+
+  # The env-file was only needed to create the container; safe to remove now.
   [[ -n "$envfile" ]] && rm -f "$envfile"
-  trap - EXIT
+
+  log_ok "Server started in the background."
+  echo ""
+  print_api_usage_banner "$port"
 }
 
 # ── cmd: stop ─────────────────────────────────────────────────────────────────
 cmd_stop() {
   header "🛑 Stop Model Server"
   if docker inspect "$CONTAINER_NAME" &>/dev/null 2>&1; then
-    docker stop "$CONTAINER_NAME"
+    log_info "Stopping '${CONTAINER_NAME}' (up to 3s grace period)..."
+    docker stop --time=3 "$CONTAINER_NAME" &>/dev/null || true
+    # Force-remove regardless — covers containers stuck/hung on shutdown
+    docker rm -f "$CONTAINER_NAME" &>/dev/null || true
     log_ok "Stopped container: ${CONTAINER_NAME}"
   else
     log_warn "No running container named '${CONTAINER_NAME}' found."
@@ -616,15 +723,97 @@ cmd_stop() {
 cmd_status() {
   header "📊 Server Status"
   if docker inspect "$CONTAINER_NAME" &>/dev/null 2>&1; then
-    local state
+    local state port
     state=$(docker inspect -f '{{.State.Status}}' "$CONTAINER_NAME")
     log_ok "Container '${CONTAINER_NAME}' is ${state}"
     docker inspect -f \
       '  Image:   {{.Config.Image}}{{"\n"}}  Started: {{.State.StartedAt}}' \
       "$CONTAINER_NAME"
+
+    if [[ "$state" == "running" ]]; then
+      port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "8080/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null || echo "")
+      if [[ -n "$port" ]]; then
+        echo ""
+        log_info "  Web UI  : http://localhost:${port}"
+        log_info "  API     : http://localhost:${port}/v1"
+      fi
+    fi
   else
     log_warn "Container '${CONTAINER_NAME}' is not running."
+    log_warn "  → Start it with: bash $(basename "$0") run"
   fi
+}
+
+# ── Running server info ────────────────────────────────────────────────────────
+#
+#  Used to show "what's currently running" at the top of the interactive menu.
+#
+get_running_server_info() {
+  docker inspect "$CONTAINER_NAME" &>/dev/null 2>&1 || return 1
+
+  local state
+  state=$(docker inspect -f '{{.State.Status}}' "$CONTAINER_NAME" 2>/dev/null || echo "")
+  [[ "$state" == "running" ]] || return 1
+
+  local src dir_name display port
+  src=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/models"}}{{.Source}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
+  dir_name=$(basename "${src:-unknown}")
+  display=$(model_display "$dir_name")
+  port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "8080/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+
+  printf '%s|%s\n' "$display" "$port"
+}
+
+print_running_banner() {
+  local info display port rule
+  info=$(get_running_server_info) || return 0
+  [[ -z "$info" ]] && return 0
+
+  display="${info%%|*}"
+  port="${info##*|}"
+  rule=$(printf '─%.0s' {1..64})
+
+  echo -e "${BOLD}${GREEN}${rule}${NC}"
+  echo -e "${BOLD}${GREEN}  ● RUNNING${NC}   ${BOLD}${display}${NC}"
+  echo -e "    Web UI : ${CYAN}http://localhost:${port}${NC}"
+  echo -e "    API    : ${CYAN}http://localhost:${port}/v1${NC}   ${DIM}(OpenAI-compatible)${NC}"
+  echo -e "${BOLD}${GREEN}${rule}${NC}"
+  echo ""
+}
+
+# ── Interactive main menu ──────────────────────────────────────────────────────
+main_menu() {
+  while true; do
+    echo -e "\n${BOLD}${CYAN}llama-docker-manager${NC} ${DIM}v${VERSION}${NC}"
+    echo ""
+    print_running_banner
+
+    echo -e "${BOLD}What would you like to do?${NC}"
+    echo -e "  ${BOLD}1)${NC} List installed models"
+    echo -e "  ${BOLD}2)${NC} Download a model"
+    echo -e "  ${BOLD}3)${NC} Run a model (start server)"
+    echo -e "  ${BOLD}4)${NC} Stop the running server"
+    echo -e "  ${BOLD}5)${NC} Server status"
+    echo -e "  ${BOLD}6)${NC} Delete a model"
+    echo -e "  ${BOLD}q)${NC} Quit"
+    echo ""
+    read -rp "Choice: " menu_choice
+    echo ""
+
+    case "${menu_choice,,}" in
+      1) cmd_list ;;
+      2) cmd_download ;;
+      3) cmd_run ;;
+      4) cmd_stop ;;
+      5) cmd_status ;;
+      6) cmd_delete ;;
+      q|quit|exit) log_info "Bye!"; exit 0 ;;
+      *) log_warn "Invalid choice: '${menu_choice}'" ;;
+    esac
+
+    echo ""
+    read -rp "Press Enter to continue..." _
+  done
 }
 
 # ── Usage ─────────────────────────────────────────────────────────────────────
@@ -633,13 +822,15 @@ usage() {
 ${BOLD}${CYAN}llama-docker-manager${NC} v${VERSION}  llama.cpp model manager
 
 ${BOLD}Usage:${NC}
+  $(basename "$0")                Launch the interactive menu
   $(basename "$0") <command> [args]
 
 ${BOLD}Commands:${NC}
+  ${GREEN}menu${NC}               Launch the interactive menu (same as no args)
   ${GREEN}list${NC}               Show installed models
   ${GREEN}download${NC} [repo…]   Download from models.txt, or pass repo IDs directly
   ${GREEN}delete${NC}             Interactively delete a model
-  ${GREEN}run${NC}                Launch llama.cpp server (interactive)
+  ${GREEN}run${NC}                Launch llama.cpp server in the background and return
   ${GREEN}stop${NC}               Stop the running server container
   ${GREEN}status${NC}             Show server container status
 
@@ -669,14 +860,16 @@ ${BOLD}Examples:${NC}
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 main() {
-  if [[ $# -eq 0 ]]; then usage; exit 0; fi
-
   load_env_file
   require_cmd docker
+  check_docker
+
+  if [[ $# -eq 0 ]]; then main_menu; exit 0; fi
 
   local cmd="$1"; shift
 
   case "$cmd" in
+    menu)                main_menu ;;
     list|ls)             cmd_list ;;
     download|dl)         cmd_download "$@" ;;
     delete|rm)           cmd_delete ;;
